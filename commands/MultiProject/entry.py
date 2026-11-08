@@ -12,10 +12,10 @@ CMD_ID = f'{config.COMPANY_NAME}_{config.ADDIN_NAME}_MultiProject'
 CMD_NAME = 'Multi-Project'
 CMD_DESCRIPTION = 'Project multiple objects into the active sketch using window selection.'
 
-# Specify that the command will be promoted to the panel
+# Specify that the command will be promoted to the panel by default
 IS_PROMOTED = True
 
-# Target toolbar panel and placement
+# Target toolbar panel and default placement
 PANEL_ID = 'SketchCreatePanel'
 COMMAND_BESIDE_ID = 'ProjectIncludeDropDown'
 
@@ -38,8 +38,17 @@ def start():
         app = adsk.core.Application.get()
         ui = app.userInterface
 
-        # Clean up any existing instance to support seamless hot-reloading
+        # Clean up any existing instance to support seamless hot-reloading,
+        # saving its position first if it already exists in the panel.
         stop()
+
+        # Load persistent user settings (including saved panel placement)
+        settings = config.load_settings()
+        is_promoted = bool(settings.get('is_promoted', IS_PROMOTED))
+        drop_pos_id = str(settings.get('dropdown_position_id', COMMAND_BESIDE_ID) or '')
+        drop_is_before = bool(settings.get('dropdown_is_before', False))
+        prom_pos_id = str(settings.get('promoted_position_id', '') or '')
+        prom_is_before = bool(settings.get('promoted_is_before', False))
 
         # Create the command definition
         cmd_def = ui.commandDefinitions.addButtonDefinition(
@@ -52,16 +61,32 @@ def start():
         # Define an event handler for the command created event
         futil.add_handler(cmd_def.commandCreated, command_created)
 
-        # Add button to the Sketch -> Create panel
+        # Listen to command termination so any user drag/reorder of the button in the panel is saved
+        futil.add_handler(ui.commandTerminated, on_ui_command_terminated)
+
+        # Add button to the Sketch -> Create panel at its saved position
         panel = ui.allToolbarPanels.itemById(PANEL_ID)
         if panel:
-            beside_control = panel.controls.itemById(COMMAND_BESIDE_ID)
-            if beside_control:
+            if drop_pos_id and panel.controls.itemById(drop_pos_id):
+                control = panel.controls.addCommand(cmd_def, drop_pos_id, drop_is_before)
+            elif panel.controls.itemById(COMMAND_BESIDE_ID):
                 control = panel.controls.addCommand(cmd_def, COMMAND_BESIDE_ID, False)
             else:
                 control = panel.controls.addCommand(cmd_def)
-            control.isPromoted = IS_PROMOTED
-            control.isPromotedByDefault = IS_PROMOTED
+
+            if is_promoted:
+                promoted_ok = False
+                if prom_pos_id:
+                    try:
+                        promoted_ok = control.promote(True, prom_pos_id, prom_is_before)
+                    except:
+                        promoted_ok = False
+                if not promoted_ok:
+                    control.isPromoted = True
+                    control.isPromotedByDefault = True
+            else:
+                control.isPromoted = False
+                control.isPromotedByDefault = False
 
     except:
         futil.handle_error('start')
@@ -73,9 +98,14 @@ def stop():
         app = adsk.core.Application.get()
         ui = app.userInterface
 
-        # Clean up button control from panel
         panel = ui.allToolbarPanels.itemById(PANEL_ID)
         if panel:
+            # Capture and save the user's current panel ordering before deleting the control
+            active_ctrl = panel.controls.itemById(CMD_ID)
+            if active_ctrl:
+                _capture_panel_position(panel, adsk.core.CommandControl.cast(active_ctrl))
+
+            # Clean up button control from panel
             for cid in (CMD_ID, 'MultiProjectCmd'):
                 control = panel.controls.itemById(cid)
                 if control:
@@ -91,10 +121,132 @@ def stop():
         futil.handle_error('stop')
 
 
+def _capture_panel_position(panel: adsk.core.ToolbarPanel, control: adsk.core.CommandControl):
+    """Captures and persists the current ordering and promotion state of the button in the panel."""
+    try:
+        if not panel or not control or not control.isValid:
+            return
+
+        settings = config.load_settings()
+        changed = False
+        ignored_ids = {CMD_ID, 'MultiProjectCmd'}
+
+        # 1. Promotion state
+        is_promoted = bool(control.isPromoted)
+        if settings.get('is_promoted') != is_promoted:
+            settings['is_promoted'] = is_promoted
+            changed = True
+
+        # 2. Relative position inside panel.controls (dropdown menu order)
+        controls = panel.controls
+        ctrl_idx = -1
+        for i in range(controls.count):
+            item = controls.item(i)
+            if item and item.id == control.id:
+                ctrl_idx = i
+                break
+
+        if ctrl_idx >= 0:
+            drop_pos_id = ''
+            drop_is_before = False
+            if ctrl_idx > 0:
+                for j in range(ctrl_idx - 1, -1, -1):
+                    prev_ctrl = controls.item(j)
+                    if prev_ctrl and prev_ctrl.id and prev_ctrl.id not in ignored_ids:
+                        drop_pos_id = prev_ctrl.id
+                        drop_is_before = False
+                        break
+            if not drop_pos_id and controls.count > 1:
+                for j in range(ctrl_idx + 1, controls.count):
+                    next_ctrl = controls.item(j)
+                    if next_ctrl and next_ctrl.id and next_ctrl.id not in ignored_ids:
+                        drop_pos_id = next_ctrl.id
+                        drop_is_before = True
+                        break
+
+            if drop_pos_id:
+                if (settings.get('dropdown_position_id') != drop_pos_id or
+                        settings.get('dropdown_is_before') != drop_is_before):
+                    settings['dropdown_position_id'] = drop_pos_id
+                    settings['dropdown_is_before'] = drop_is_before
+                    changed = True
+
+        # 3. Relative position inside panel.promotedControls (ribbon toolbar order)
+        if is_promoted:
+            prom_controls = panel.promotedControls
+            prom_idx = -1
+            for i in range(prom_controls.count):
+                item = prom_controls.item(i)
+                if item and item.id == control.id:
+                    prom_idx = i
+                    break
+
+            if prom_idx >= 0:
+                prom_pos_id = ''
+                prom_is_before = False
+                if prom_idx > 0:
+                    for j in range(prom_idx - 1, -1, -1):
+                        prev_prom = prom_controls.item(j)
+                        if prev_prom and prev_prom.id and prev_prom.id not in ignored_ids:
+                            prom_pos_id = prev_prom.id
+                            prom_is_before = False
+                            break
+                if not prom_pos_id and prom_controls.count > 1:
+                    for j in range(prom_idx + 1, prom_controls.count):
+                        next_prom = prom_controls.item(j)
+                        if next_prom and next_prom.id and next_prom.id not in ignored_ids:
+                            prom_pos_id = next_prom.id
+                            prom_is_before = True
+                            break
+
+                if prom_pos_id:
+                    if (settings.get('promoted_position_id') != prom_pos_id or
+                            settings.get('promoted_is_before') != prom_is_before):
+                        settings['promoted_position_id'] = prom_pos_id
+                        settings['promoted_is_before'] = prom_is_before
+                        changed = True
+
+        if changed:
+            config.save_settings(settings)
+            futil.log(
+                f'{CMD_NAME}: Saved panel placement '
+                f'(promoted={is_promoted}, '
+                f'promoted_beside={settings.get("promoted_position_id")} [before={settings.get("promoted_is_before")}], '
+                f'dropdown_beside={settings.get("dropdown_position_id")} [before={settings.get("dropdown_is_before")}])'
+            )
+
+    except:
+        futil.handle_error('_capture_panel_position')
+
+
+def _sync_panel_position():
+    """Helper to inspect SketchCreatePanel and persist current button ordering."""
+    try:
+        app = adsk.core.Application.get()
+        ui = app.userInterface
+        if not ui:
+            return
+        panel = ui.allToolbarPanels.itemById(PANEL_ID)
+        if panel:
+            ctrl = panel.controls.itemById(CMD_ID)
+            if ctrl:
+                _capture_panel_position(panel, adsk.core.CommandControl.cast(ctrl))
+    except:
+        pass
+
+
+def on_ui_command_terminated(args: adsk.core.ApplicationCommandEventArgs):
+    """Automatically saves panel position whenever commands finish in the UI."""
+    _sync_panel_position()
+
+
 def command_created(args: adsk.core.CommandCreatedEventArgs):
     """Called when user clicks the Multi-Project button."""
     try:
         futil.log(f'{CMD_NAME} Command Created Event')
+
+        # Save panel position if the user moved the button prior to clicking it
+        _sync_panel_position()
 
         app = adsk.core.Application.get()
         ui = app.userInterface
@@ -114,31 +266,36 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
         futil.add_handler(cmd.destroy, command_destroy, local_handlers=local_handlers)
 
         inputs = cmd.commandInputs
+        settings = config.load_settings()
+        default_mode = settings.get('default_filter_mode', FILTER_MODE_GEOMETRY)
+        is_body_default = (default_mode == FILTER_MODE_BODY)
 
-        # Button Row Input for selecting Filter Mode
-        filter_row = inputs.addButtonRowCommandInput('filterRow', 'Selection Filter', False)
-        filter_row.listItems.add(FILTER_MODE_GEOMETRY, True, GEOMETRY_ICON_FOLDER)
-        filter_row.listItems.add(FILTER_MODE_BODY, False, BODY_ICON_FOLDER)
-        filter_row.tooltip = 'Switch between Line/Geometry and Body/Component selection modes.'
-
-        # Create selection input
+        # Row 1 (Top Row): Select Objects selection input
         sel_input = inputs.addSelectionInput(
             'selectionInput',
             'Select Objects',
             'Window select edges, faces, vertices, or sketch curves to project'
         )
 
-        # Default filters: Line / Geometry mode
-        _apply_geometry_filters(sel_input)
+        # Row 2: Selection Filter button row (Line / Geometry vs Body / Component)
+        filter_row = inputs.addButtonRowCommandInput('filterRow', 'Selection Filter', False)
+        filter_row.listItems.add(FILTER_MODE_GEOMETRY, not is_body_default, GEOMETRY_ICON_FOLDER)
+        filter_row.listItems.add(FILTER_MODE_BODY, is_body_default, BODY_ICON_FOLDER)
+        filter_row.tooltip = 'Switch between Line/Geometry and Body/Component selection modes.'
+
+        # Apply initial selection filters matching active button row item
+        if is_body_default:
+            _apply_body_filters(sel_input)
+        else:
+            _apply_geometry_filters(sel_input)
 
         # Limits from 1 to 0 (infinite) enables window / crossing selection box
         sel_input.setSelectionLimits(1, 0)
 
-        # Detect Direct Modeling vs Parametric Modeling workflow
+        # Row 3: Link Projections checkbox (for Parametric modeling)
         design = adsk.fusion.Design.cast(app.activeProduct)
         is_parametric = design and (design.designType == adsk.fusion.DesignTypes.ParametricDesignType)
 
-        # Add link option for Parametric modeling
         link_input = inputs.addBoolValueInput(
             'link_input',
             'Link Projections',
@@ -152,6 +309,9 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
             link_input.tooltip = 'Projection linking is disabled in Direct Modeling (no timeline history).'
         else:
             link_input.tooltip = 'Maintain parametric associative link to source geometry.'
+
+        # Ensure the top Select Objects input has active focus immediately
+        sel_input.hasFocus = True
 
     except:
         futil.handle_error('command_created')
@@ -175,8 +335,19 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
             selected_item = btn_row.selectedItem
             if selected_item and selected_item.name == FILTER_MODE_BODY:
                 _apply_body_filters(sel_input)
+                mode_name = FILTER_MODE_BODY
             else:
                 _apply_geometry_filters(sel_input)
+                mode_name = FILTER_MODE_GEOMETRY
+
+            # Keep focus on the Select Objects input on the top row
+            sel_input.hasFocus = True
+
+            # Persist preferred filter mode
+            settings = config.load_settings()
+            if settings.get('default_filter_mode') != mode_name:
+                settings['default_filter_mode'] = mode_name
+                config.save_settings(settings)
 
     except:
         futil.handle_error('command_input_changed')
@@ -214,9 +385,10 @@ def command_validate_inputs(args: adsk.core.ValidateInputsEventArgs):
 
 
 def command_destroy(args: adsk.core.CommandEventArgs):
-    """Cleans up local handlers when the command dialog terminates."""
+    """Cleans up local handlers and syncs panel order when the command dialog terminates."""
     try:
         futil.log(f'{CMD_NAME} Command Destroy Event')
+        _sync_panel_position()
         global local_handlers
         local_handlers = []
     except:
