@@ -2,7 +2,7 @@
     "is_promoted": true,
     "dropdown_position_id": "ProjectIncludeDropDown",
     "dropdown_is_before": false,
-    "promoted_position_id": "CircleElipse",
+    "promoted_position_id": "ProjectNewCmd",
     "promoted_is_before": false,
     "default_filter_mode": "Line / Geometry"
 }
